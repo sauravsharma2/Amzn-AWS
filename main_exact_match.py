@@ -1,4 +1,4 @@
-# main_exact_match.py — exact name matching (normalised name + legal form), no Links/BO_links.
+# main_exact_match.py — exact name matching (normalised name + legal form). Links used only for an info column.
 #
 # Flow:
 #   1) Load original IDs from cases.txt (+ Name/Address/City/Postcode/Country from Companies).
@@ -6,10 +6,11 @@
 #   3) Normalise both sides (name_normalisation, country hook = first 2 chars of the Id).
 #   4) Keep pairs where:
 #        - normalised compact name is 100% equal,
-#        - legal forms are compatible (same, or at least one side has none),
+#        - legal forms identical (no legal form only matches no legal form),
 #        - country rule passes (same prefix / matched YY / allowed pair / original YY),
 #        - OriginalId != MatchedId.
-#   5) Export output/matches.xlsx with 2 sheets: Matched, NoMatch (all propositions kept).
+#   5) Add SharedOwnershipLink (info only): shared shareholder / subsidiary / BO / BO subsidiary / UO.
+#   6) Export output/matches.xlsx with 2 sheets: Matched, NoMatch (all propositions kept).
 
 import os
 import re
@@ -24,9 +25,10 @@ from unicodedata import category, normalize
 import pandas as pd
 
 from run_finalize import finalize_run
+import src.code.name_normalisation as nn
 from src.code.name_normalisation import _build_legal_union, exact_normalization_series
 from src.db_connexion.data_extraction import connect_db, load_query
-from utils.config import LEGAL_FORM_DICT
+from utils.config import LEGAL_FORM_DICT, WORDS_TO_DELETE
 
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
@@ -40,6 +42,9 @@ CASES_FILE = "cases.txt"
 CASES_SQL = "queries/get_cases_with_address.sql"
 POPULATION_SQL = "queries/fetch_population.sql"   # your population query
 POPULATION_BATCH_SIZE = 500_000
+SHARED_LINKS_SQL = "queries/get_shared_ownership_links.sql"
+SHARED_LINKS_PAIR_BATCH = 1000
+SHARED_LINKS_MAX_IDS = 5          # max shared IDs listed per link type in the cell (count always shown)
 
 OUTPUT_DIR = Path("output")
 XLSX_PATH = OUTPUT_DIR / "matches.xlsx"
@@ -48,6 +53,11 @@ XLSX_PATH = OUTPUT_DIR / "matches.xlsx"
 WILDCARD_PREFIX = "YY"
 # Extra allowed country pairs (both directions).
 ALLOWED_COUNTRY_PAIRS = {("CN", "HK")}
+
+# Words from utils/config.py WORDS_TO_DELETE that should NOT be removed in this script.
+# Only affects main_exact_match.py (other scripts keep the full list). Lowercase.
+# Example: WORDS_TO_KEEP = {"in", "en", "cooperativa"}
+WORDS_TO_KEEP: set = set()
 
 DETAIL_COLS = ["Name", "Address", "City", "Country", "Postcode"]
 
@@ -58,6 +68,9 @@ MATCHED_SHEET_COLS = [
     "MatchedCity", "MatchedCountry", "MatchedPostcode",
 ]
 NOMATCH_SHEET_COLS = MATCHED_SHEET_COLS[:7]
+SHARED_LINK_COL = "SharedOwnershipLink"   # info only, added after matching (no filtering)
+LINK_TYPE_ORDER = ["Shareholder", "Subsidiary", "BO", "BO Subsidiary", "UO"]
+NO_LINK_TEXT = "No shared link"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,10 +112,12 @@ def extract_legal_forms(name) -> str:
 
 
 def legal_forms_compatible(orig_lf: pd.Series, match_lf: pd.Series) -> pd.Series:
-    """Accept if equal, or if at least one side has no legal form. Reject only if both present and different."""
-    orig_lf = orig_lf.fillna("")
-    match_lf = match_lf.fillna("")
-    return (orig_lf == "") | (match_lf == "") | (orig_lf == match_lf)
+    """
+    Strict: legal form code(s) must be identical on both sides.
+    - Original has legal form X  -> matched must have X.
+    - Original has no legal form -> matched must have no legal form.
+    """
+    return orig_lf.fillna("") == match_lf.fillna("")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +239,19 @@ def stream_population(batch_size: int = POPULATION_BATCH_SIZE) -> Iterator[pd.Da
 #  Matching
 # ─────────────────────────────────────────────────────────────────────────────
 
+def apply_words_to_keep() -> None:
+    """Rebuilds name_normalisation.WORDS_RE without WORDS_TO_KEEP (local to this script's run)."""
+    keep = {w.lower() for w in WORDS_TO_KEEP}
+    if not keep:
+        return
+    words = sorted({w.lower() for w in WORDS_TO_DELETE} - keep)
+    nn.WORDS_RE = (
+        re.compile(r"\b(?:%s)\b" % "|".join(map(re.escape, words)), re.IGNORECASE)
+        if words else re.compile(r"$(?!)")
+    )
+    print(f"[NORMALISATION] Not removing: {sorted(keep)}")
+
+
 def prepare_cases(df_cases: pd.DataFrame) -> pd.DataFrame:
     df = df_cases.copy()
     df["Id"] = df["Id"].astype(str)
@@ -285,6 +313,103 @@ def run_matching(cases: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Shared ownership links (info only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@connect_db
+def fetch_shared_links(conn, pairs: List[tuple]) -> pd.DataFrame:
+    """
+    pairs = [(OriginalId_base, MatchedId_base)]. Returns OriginalId, MatchedId, LinkType, SharedId.
+    LinkType: Shareholder, Subsidiary, BO, BO Subsidiary, UO.
+    """
+    cols = ["OriginalId", "MatchedId", "LinkType", "SharedId"]
+    if not pairs:
+        return pd.DataFrame(columns=cols)
+
+    sql = load_query(SHARED_LINKS_SQL)
+    parts = []
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#SharedPairs') IS NOT NULL DROP TABLE #SharedPairs;
+            CREATE TABLE #SharedPairs (OId VARCHAR(50) NOT NULL, MId VARCHAR(50) NOT NULL,
+                                       PRIMARY KEY (OId, MId));
+        """)
+        conn.commit()
+        n_batches = (len(pairs) + SHARED_LINKS_PAIR_BATCH - 1) // SHARED_LINKS_PAIR_BATCH
+        for b, i in enumerate(range(0, len(pairs), SHARED_LINKS_PAIR_BATCH), start=1):
+            chunk = pairs[i:i + SHARED_LINKS_PAIR_BATCH]
+            cur.execute("TRUNCATE TABLE #SharedPairs")
+            values = ",".join(
+                "('{}','{}')".format(o.replace("'", "''"), m.replace("'", "''")) for o, m in chunk
+            )
+            cur.execute(f"INSERT INTO #SharedPairs (OId, MId) VALUES {values}")
+            conn.commit()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            if rows:
+                parts.append(pd.DataFrame.from_records([tuple(r) for r in rows], columns=cols))
+            print(f"[LINKS] batch {b}/{n_batches} | pairs={len(chunk)} | shared rows={len(rows)}", flush=True)
+    finally:
+        try:
+            cur.execute("IF OBJECT_ID('tempdb..#SharedPairs') IS NOT NULL DROP TABLE #SharedPairs")
+            conn.commit()
+        except Exception as e:
+            print(f"[WARN] cleanup #SharedPairs: {e}")
+
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+
+def format_shared_links(links: pd.DataFrame) -> pd.Series:
+    """
+    One text per (OriginalId, MatchedId), e.g.
+    'Shareholder(2): DE123, DE456 | UO(1): US999'. Max SHARED_LINKS_MAX_IDS IDs listed per type.
+    """
+    if links.empty:
+        return pd.Series(dtype="object")
+
+    def _fmt(g: pd.DataFrame) -> str:
+        out = []
+        for lt in LINK_TYPE_ORDER:
+            ids = sorted(g.loc[g["LinkType"] == lt, "SharedId"].astype(str).unique())
+            if not ids:
+                continue
+            shown = ", ".join(ids[:SHARED_LINKS_MAX_IDS])
+            more = f" +{len(ids) - SHARED_LINKS_MAX_IDS} more" if len(ids) > SHARED_LINKS_MAX_IDS else ""
+            out.append(f"{lt}({len(ids)}): {shown}{more}")
+        return " | ".join(out)
+
+    return links.groupby(["OriginalId", "MatchedId"], sort=False).apply(_fmt)
+
+
+def add_shared_links(matched: pd.DataFrame) -> pd.DataFrame:
+    """Adds SharedOwnershipLink column. Never removes rows. NO_LINK_TEXT when nothing shared."""
+    df = matched.copy()
+    if df.empty:
+        df[SHARED_LINK_COL] = pd.Series(dtype="object")
+        return df
+
+    o_base = df["OriginalId"].astype(str).str.rstrip("!")
+    m_base = df["MatchedId"].astype(str).str.rstrip("!")
+    pairs = list(dict.fromkeys(zip(o_base, m_base)))
+
+    try:
+        links = fetch_shared_links(pairs)
+    except Exception as e:
+        print(f"[LINKS][ERROR] shared link lookup failed, column left as 'N/A': {e}")
+        traceback.print_exc()
+        df[SHARED_LINK_COL] = "N/A (lookup failed)"
+        return df
+
+    text = format_shared_links(links)
+    lookup = text.to_dict() if not text.empty else {}
+    df[SHARED_LINK_COL] = [lookup.get((o, m)) or NO_LINK_TEXT for o, m in zip(o_base, m_base)]
+    n_with = int((df[SHARED_LINK_COL] != NO_LINK_TEXT).sum())
+    print(f"[LINKS] {n_with}/{len(df)} propositions have at least one shared ownership link")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Export
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -316,6 +441,7 @@ def run() -> dict:
         sys.stdout.reconfigure(encoding="utf-8")
     warnings.filterwarnings("ignore")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    apply_words_to_keep()
 
     print("[1] Loading cases...")
     case_ids = read_case_ids()
@@ -329,7 +455,12 @@ def run() -> dict:
     matched = run_matching(cases)
     print(f"    -> {len(matched)} propositions in {time.perf_counter() - t:.1f}s")
 
-    print("[3] Export...")
+    print("[3] Shared ownership links (info only)...")
+    t = time.perf_counter()
+    matched = add_shared_links(matched)
+    print(f"    -> done in {time.perf_counter() - t:.1f}s")
+
+    print("[4] Export...")
     nomatch = build_nomatch(case_ids, cases, matched)
     export(matched, nomatch)
 
