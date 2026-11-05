@@ -1,48 +1,50 @@
 -- Shared ownership links between OriginalId and MatchedId (info only).
--- #SharedPairs (OId, MId) is filled by main_exact_match.py (IDs without trailing '!').
--- Returns one row per shared entity: OriginalId, MatchedId, LinkType, SharedId.
+-- Same pattern as get_links_information_*.sql:
+--   1) pull links only for the batch IDs with IN (...)  -> index seek on Links / BO_links / UO_links
+--   2) compare O vs M inside the small temp table.
+-- #PairsToProcess (O_Id, M_Id) is created and filled by check_shared_links.py.
+-- {ids_list} = all OriginalIds + MatchedIds of the batch (without trailing '!').
 
--- Same shareholder (Links, both are children of the same parent)
-SELECT p.OId AS OriginalId, p.MId AS MatchedId, 'Shareholder' AS LinkType, o.ParentId AS SharedId
-FROM #SharedPairs p
-JOIN bvdaffils.dbo.Links o WITH (NOLOCK) ON o.ChildId = p.OId AND o.Type = 1
-JOIN bvdaffils.dbo.Links m WITH (NOLOCK) ON m.ChildId = p.MId AND m.Type = 1 AND m.ParentId = o.ParentId
-WHERE o.ParentId NOT IN (p.OId, p.MId)
+SET NOCOUNT ON;
 
-UNION
+SELECT l.ChildId AS Id, l.ParentId AS SharedId, CAST('Shareholder' AS VARCHAR(20)) AS LinkType
+INTO #RawShared
+FROM bvdaffils.dbo.Links l WITH (NOLOCK)
+WHERE l.ChildId IN ({ids_list}) AND l.Type = 1;
 
--- Same subsidiary (Links, both are parents of the same child)
-SELECT p.OId, p.MId, 'Subsidiary', o.ChildId
-FROM #SharedPairs p
-JOIN bvdaffils.dbo.Links o WITH (NOLOCK) ON o.ParentId = p.OId AND o.Type = 1
-JOIN bvdaffils.dbo.Links m WITH (NOLOCK) ON m.ParentId = p.MId AND m.Type = 1 AND m.ChildId = o.ChildId
-WHERE o.ChildId NOT IN (p.OId, p.MId)
+INSERT INTO #RawShared (Id, SharedId, LinkType)
+SELECT l.ParentId, l.ChildId, 'Subsidiary'
+FROM bvdaffils.dbo.Links l WITH (NOLOCK)
+WHERE l.ParentId IN ({ids_list}) AND l.Type = 1;
 
-UNION
+INSERT INTO #RawShared (Id, SharedId, LinkType)
+SELECT l.ChildId, l.ParentId, 'BO'
+FROM bvdaffils.dbo.BO_links l WITH (NOLOCK)
+WHERE l.ChildId IN ({ids_list});
 
--- Same beneficial owner (BO_links)
-SELECT p.OId, p.MId, 'BO', o.ParentId
-FROM #SharedPairs p
-JOIN bvdaffils.dbo.BO_links o WITH (NOLOCK) ON o.ChildId = p.OId
-JOIN bvdaffils.dbo.BO_links m WITH (NOLOCK) ON m.ChildId = p.MId AND m.ParentId = o.ParentId
-WHERE o.ParentId NOT IN (p.OId, p.MId)
+INSERT INTO #RawShared (Id, SharedId, LinkType)
+SELECT l.ParentId, l.ChildId, 'BO Subsidiary'
+FROM bvdaffils.dbo.BO_links l WITH (NOLOCK)
+WHERE l.ParentId IN ({ids_list});
 
-UNION
+INSERT INTO #RawShared (Id, SharedId, LinkType)
+SELECT l.ChildId, l.ParentId, 'UO'
+FROM bvdaffils.dbo.UO_links l WITH (NOLOCK)
+WHERE l.ChildId IN ({ids_list});
 
--- Same beneficial subsidiary (BO_links)
-SELECT p.OId, p.MId, 'BO Subsidiary', o.ChildId
-FROM #SharedPairs p
-JOIN bvdaffils.dbo.BO_links o WITH (NOLOCK) ON o.ParentId = p.OId
-JOIN bvdaffils.dbo.BO_links m WITH (NOLOCK) ON m.ParentId = p.MId AND m.ChildId = o.ChildId
-WHERE o.ChildId NOT IN (p.OId, p.MId)
+CREATE CLUSTERED INDEX IX_RS ON #RawShared(Id, LinkType, SharedId);
 
-UNION
-
--- Same ultimate owner (UO_links)
-SELECT p.OId, p.MId, 'UO', o.ParentId
-FROM #SharedPairs p
-JOIN bvdaffils.dbo.UO_links o WITH (NOLOCK) ON o.ChildId = p.OId
-JOIN bvdaffils.dbo.UO_links m WITH (NOLOCK) ON m.ChildId = p.MId AND m.ParentId = o.ParentId
-WHERE o.ParentId NOT IN (p.OId, p.MId)
-
+SELECT DISTINCT
+    p.O_Id     AS OriginalId,
+    p.M_Id     AS MatchedId,
+    o.LinkType AS LinkType,
+    o.SharedId AS SharedId
+FROM #PairsToProcess p
+JOIN #RawShared o ON o.Id = p.O_Id
+JOIN #RawShared m ON m.Id = p.M_Id
+                 AND m.LinkType = o.LinkType
+                 AND m.SharedId = o.SharedId
+WHERE o.SharedId NOT IN (p.O_Id, p.M_Id)
 OPTION (RECOMPILE);
+
+DROP TABLE IF EXISTS #RawShared;
